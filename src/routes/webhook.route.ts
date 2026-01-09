@@ -27,7 +27,9 @@ export default async function webhookRoutes(fastify: FastifyInstance) {
         }
 
         const session = event.data.object as Stripe.Checkout.Session;
-        const { eventId, userId } = session.metadata || {};
+        const { eventId, userId, quantity } = session.metadata || {};
+
+        const seatsToProcess = quantity ? parseInt(quantity, 10) : 1;
 
         // Added error logging for debugging missing metadata
         if (!eventId || !userId) {
@@ -41,17 +43,17 @@ export default async function webhookRoutes(fastify: FastifyInstance) {
         switch (event.type) {
             case 'checkout.session.completed':
                 // 💰 Payment Received: Confirm user
-                await EventManager.confirmSeat(eventId, userId, event.id);
+                await EventManager.confirmSeat(eventId, userId, event.id, seatsToProcess);
                 break;
 
             case 'checkout.session.expired':
                 // ⏳ Time ran out: Release seat
-                await EventManager.releaseSeat(eventId, event.id);
+                await EventManager.releaseSeat(eventId, event.id, seatsToProcess);
                 break;
 
             case 'checkout.session.async_payment_failed':
                 // ❌ Failed: Release seat
-                await EventManager.releaseSeat(eventId, event.id);
+                await EventManager.releaseSeat(eventId, event.id, seatsToProcess);
                 break;
         }
 

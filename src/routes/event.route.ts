@@ -36,6 +36,7 @@ export default async function eventRoutes(fastify: FastifyInstance) {
                 availableSeats: body.seats
             };
 
+            // Save to "events" collection
             const docRef = await db.collection("events").add(newEvent);
 
             return reply.code(201).send({ success: true, id: docRef.id });
@@ -55,6 +56,7 @@ export default async function eventRoutes(fastify: FastifyInstance) {
                 return reply.code(404).send({ error: "Event not found" });
             }
 
+            // Return data with the ID included
             return { id: doc.id, ...doc.data() };
         } catch (err) {
             request.log.error(err);
@@ -62,32 +64,40 @@ export default async function eventRoutes(fastify: FastifyInstance) {
         }
     });
 
-    fastify.post<{ Params: { id: string } }>("/api/events/:id/join", {
-        preHandler: firebaseAuth
+    fastify.post<{ Params: { id: string }, Body: { quantity?: number } }>("/api/events/:id/join", {
+        preHandler: firebaseAuth,
+        schema: {
+            body: {
+                type: "object",
+                properties: {
+                    quantity: { type: "integer", minimum: 1, maximum: 4 }
+                }
+            }
+        }
     }, async (request, reply) => {
         try {
             const eventId = request.params.id;
             const userId = request.user?.uid;
             const userEmail = request.user?.email || "unknown";
 
+            // 🔴 FIX: Safety check for body using "?."
+            const quantity = request.body?.quantity || 1;
+
             if (!userId) {
                 return reply.code(401).send({ error: "Unauthorized" });
             }
 
-            // 1. Call the Reserve Logic (Locks seat, gets Stripe URL)
-            const result = await EventManager.reserveSeat(eventId, userId, userEmail);
+            const result = await EventManager.reserveSeat(eventId, userId, userEmail, quantity);
 
-            // 2. Handle Logic Errors (Sold out, already joined, etc.)
             if (result.error) {
-                // 409 Conflict is appropriate for "Sold Out" or "Already Joined"
+                // Return 409 for logical errors (Sold Out), 500 is only for crashes
                 return reply.code(409).send({ error: result.error });
             }
 
-            // 3. Success: Send the Stripe Link to the client
             return {
                 success: true,
                 paymentUrl: result.url,
-                message: "Seat reserved for 30 minutes. Please complete payment."
+                message: `Reserved ${quantity} seats. Please complete payment.`
             };
 
         } catch (err) {

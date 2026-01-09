@@ -36,28 +36,28 @@ export const EventManager = {
      * 🟢 STEP 1: RESERVE SEAT
      * Optimistic locking + Firestore Transaction + Rollback capability
      */
-    async reserveSeat(eventId: string, userId: string, userEmail: string): Promise<{ url?: string; status?: string; error?: string }> {
+    async reserveSeat(eventId: string, userId: string, userEmail: string, quantity: number): Promise<{ url?: string; status?: string; error?: string }> {
         const lockKey = `lock:event:${eventId}`;
-        const lockToken = randomUUID(); // Unique token for this specific operation
+        const lockToken = randomUUID();
 
-        // 1. Acquire Redis Lock (Mutual Exclusion for performance)
         const acquired = await redis.set(lockKey, lockToken, "PX", LOCK_TTL_MS, "NX");
         if (!acquired) return { error: "System busy, please try again." };
 
         let session: Stripe.Checkout.Session | null = null;
 
         try {
-            // 2. Optimistic Check (Read from Cache/DB without transaction first to fail fast)
             const event = await this.getEvent(eventId);
             if (!event) throw new Error("Event not found");
-            if (event.availableSeats <= 0) throw new Error("Sold Out");
+
+            // Validate availability
+            if (event.availableSeats < quantity) {
+                throw new Error(`Only ${event.availableSeats} seats available`);
+            }
             if (event.attendees?.includes(userId)) throw new Error("Already joined");
 
             const isFree = event.price === 0;
 
-            // 3. Create Stripe Session ONLY if paid (Slow Network Call)
             if (!isFree) {
-                // We do this outside the DB transaction to keep the DB lock time minimal.
                 session = await stripe.checkout.sessions.create({
                     payment_method_types: ["card"],
                     mode: "payment",
@@ -65,41 +65,41 @@ export const EventManager = {
                         price_data: {
                             currency: "usd",
                             product_data: { name: event.name },
-                            unit_amount: event.price * 100,
+                            unit_amount: event.price * 100 * quantity,
                         },
-                        quantity: 1,
+                        quantity: quantity,
                     }],
-                    metadata: { eventId, userId },
+                    metadata: {
+                        eventId,
+                        userId,
+                        quantity: quantity.toString()
+                    },
                     success_url: `${process.env.CLIENT_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
                     cancel_url: `${process.env.CLIENT_URL}/cancel`,
-                    expires_at: Math.floor(Date.now() / 1000) + (60 * 60), // 30 Min Limit
+                    expires_at: Math.floor(Date.now() / 1000) + (10 * 60),
                 });
             }
 
-            // 4. Firestore Transaction (The "Moment of Truth")
-            // This guarantees we never go below 0 seats, regardless of race conditions.
             const eventRef = db.collection("events").doc(eventId);
 
             await db.runTransaction(async (t) => {
+                // 🔴 FIX: Typo was here (constPk -> const)
                 const doc = await t.get(eventRef);
                 if (!doc.exists) throw new Error("Event not found");
 
                 const data = doc.data() as Event;
-                if (data.availableSeats <= 0) {
-                    throw new Error("Sold Out"); // Abort transaction
-                }
 
-                // Check double-booking inside the transaction
+                if (data.availableSeats < quantity) {
+                    throw new Error("Sold Out");
+                }
                 if (data.attendees?.includes(userId)) {
                     throw new Error("Already joined");
                 }
 
-                // Prepare updates
                 const updates: any = {
-                    availableSeats: admin.firestore.FieldValue.increment(-1)
+                    availableSeats: admin.firestore.FieldValue.increment(-quantity)
                 };
 
-                // IF FREE: Add attendee immediately (No Webhook needed)
                 if (isFree) {
                     updates.attendees = admin.firestore.FieldValue.arrayUnion(userId);
                 }
@@ -107,12 +107,9 @@ export const EventManager = {
                 t.update(eventRef, updates);
             });
 
-            // 5. Invalidate Cache (Safe pattern)
             await redis.del(`event:${eventId}`);
 
-            // Return appropriate response
             if (isFree) {
-                console.log(`✅ Free seat confirmed immediately for ${userId} in ${eventId}`);
                 return { status: "confirmed" };
             } else {
                 return { url: session!.url! };
@@ -120,127 +117,60 @@ export const EventManager = {
 
         } catch (err: any) {
             console.error("Reserve Error:", err.message);
-
-            // 🔴 ROLLBACK: If DB write failed, we MUST cancel the Stripe session
             if (session?.id) {
-                try {
-                    await stripe.checkout.sessions.expire(session.id);
-                    console.log(`⚠️ Expired orphan session ${session.id}`);
-                } catch (expireErr) {
-                    console.error("Failed to expire session:", expireErr);
-                }
+                try { await stripe.checkout.sessions.expire(session.id); } catch { }
             }
-
             return { error: err.message || "Failed to reserve seat" };
         } finally {
-            // 6. Safe Unlock
-            const script = `
-                if redis.call("get", KEYS[1]) == ARGV[1] then
-                    return redis.call("del", KEYS[1])
-                else
-                    return 0
-                end
-            `;
-            await redis.eval(script, 1, lockKey, lockToken);
-        }
-    },
-
-    /**
-     * 🟢 STEP 2: PAYMENT SUCCESS (Called by Webhook)
-     */
-    async confirmSeat(eventId: string, userId: string, stripeEventId: string) {
-        const lockKey = `lock:event:${eventId}`;
-        const lockToken = randomUUID();
-
-        // Spinlock-ish wait (Simple implementation)
-        // Ideally use a queue processing system for webhooks, but this works for simple cases.
-        await redis.set(lockKey, lockToken, "PX", LOCK_TTL_MS);
-
-        try {
-            // 1. Idempotency Check (Critical for Webhooks)
-            // We store processed stripe event IDs to ensure we don't process the same one twice.
-            const webhookRef = db.collection("webhook_events").doc(stripeEventId);
-
-            // Run in transaction to ensure exact-once processing
-            await db.runTransaction(async (t) => {
-                const webhookDoc = await t.get(webhookRef);
-                if (webhookDoc.exists) {
-                    console.log(`Skipping duplicate event ${stripeEventId}`);
-                    return;
-                }
-
-                const eventRef = db.collection("events").doc(eventId);
-                const eventDoc = await t.get(eventRef);
-                if (!eventDoc.exists) return;
-
-                // Add user to attendees
-                t.update(eventRef, {
-                    attendees: admin.firestore.FieldValue.arrayUnion(userId)
-                });
-
-                // Mark event as processed
-                t.set(webhookRef, { processedAt: new Date(), type: 'confirmSeat' });
-            });
-
-            // Invalidate Cache
-            await redis.del(`event:${eventId}`);
-
-            // Log to stream
-            await redis.xadd("stream:events", "*", "eventId", eventId, "action", "CONFIRM_PAYMENT", "userId", userId);
-            console.log(`✅ User ${userId} confirmed for ${eventId}`);
-
-        } catch (err) {
-            console.error("Confirm Error:", err);
-        } finally {
-            // Safe Unlock
             const script = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`;
             await redis.eval(script, 1, lockKey, lockToken);
         }
     },
 
-    /**
-     * 🔴 STEP 3: PAYMENT FAILED / EXPIRED (Called by Webhook)
-     */
-    async releaseSeat(eventId: string, stripeEventId: string) {
+    async confirmSeat(eventId: string, userId: string, stripeEventId: string, quantity: number) {
         const lockKey = `lock:event:${eventId}`;
         const lockToken = randomUUID();
-
         await redis.set(lockKey, lockToken, "PX", LOCK_TTL_MS);
 
         try {
-            // 1. Idempotency Check
             const webhookRef = db.collection("webhook_events").doc(stripeEventId);
-
             await db.runTransaction(async (t) => {
                 const webhookDoc = await t.get(webhookRef);
-                if (webhookDoc.exists) {
-                    console.log(`Skipping duplicate release ${stripeEventId}`);
-                    return;
-                }
+                if (webhookDoc.exists) return;
 
                 const eventRef = db.collection("events").doc(eventId);
-
-                // Increment available seats
-                t.update(eventRef, {
-                    availableSeats: admin.firestore.FieldValue.increment(1)
-                });
-
-                // Mark processed
-                t.set(webhookRef, { processedAt: new Date(), type: 'releaseSeat' });
+                t.update(eventRef, { attendees: admin.firestore.FieldValue.arrayUnion(userId) });
+                t.set(webhookRef, { processedAt: new Date(), type: 'confirmSeat', quantity });
             });
-
-            // Invalidate Cache
             await redis.del(`event:${eventId}`);
+        } catch (err) { console.error("Confirm Error:", err); }
+        finally {
+            const script = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`;
+            await redis.eval(script, 1, lockKey, lockToken);
+        }
+    },
 
-            await redis.xadd("stream:events", "*", "eventId", eventId, "action", "RELEASE_SEAT");
-            console.log(`♻️ Seat released for ${eventId}`);
+    async releaseSeat(eventId: string, stripeEventId: string, quantity: number) {
+        const lockKey = `lock:event:${eventId}`;
+        const lockToken = randomUUID();
+        await redis.set(lockKey, lockToken, "PX", LOCK_TTL_MS);
 
-        } catch (err) {
-            console.error("Release Error:", err);
-        } finally {
-            // Safe Unlock
+        try {
+            const webhookRef = db.collection("webhook_events").doc(stripeEventId);
+            await db.runTransaction(async (t) => {
+                const webhookDoc = await t.get(webhookRef);
+                if (webhookDoc.exists) return;
+
+                const eventRef = db.collection("events").doc(eventId);
+                t.update(eventRef, { availableSeats: admin.firestore.FieldValue.increment(quantity) });
+                t.set(webhookRef, { processedAt: new Date(), type: 'releaseSeat', quantity });
+            });
+            await redis.del(`event:${eventId}`);
+        } catch (err) { console.error("Release Error:", err); }
+        finally {
             const script = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`;
             await redis.eval(script, 1, lockKey, lockToken);
         }
     }
+
 };
