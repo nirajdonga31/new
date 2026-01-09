@@ -9,7 +9,7 @@ export default async function eventRoutes(fastify: FastifyInstance) {
 
     // --- POST: Create a new Event ---
     fastify.post<{ Body: Event }>("/api/events", {
-        preHandler: firebaseAuth, // 🔒 Protect this route: Only logged in users can create
+        preHandler: firebaseAuth,
         schema: {
             body: {
                 type: "object",
@@ -36,7 +36,6 @@ export default async function eventRoutes(fastify: FastifyInstance) {
                 availableSeats: body.seats
             };
 
-            // Save to "events" collection
             const docRef = await db.collection("events").add(newEvent);
 
             return reply.code(201).send({ success: true, id: docRef.id });
@@ -56,7 +55,6 @@ export default async function eventRoutes(fastify: FastifyInstance) {
                 return reply.code(404).send({ error: "Event not found" });
             }
 
-            // Return data with the ID included
             return { id: doc.id, ...doc.data() };
         } catch (err) {
             request.log.error(err);

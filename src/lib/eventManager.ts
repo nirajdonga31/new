@@ -10,8 +10,6 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
 });
 const db = admin.firestore();
 
-// ⚙️ CONFIGURATION
-// Lock TTL reduced slightly as we are not holding it for the entire Stripe duration anymore (optimistic approach)
 const LOCK_TTL_MS = 10000;
 const SLIDING_TTL_SEC = 3600;
 

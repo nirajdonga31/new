@@ -5,7 +5,7 @@ import { EventManager } from "../lib/eventManager.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
     apiVersion: "2025-01-27.acacia" as any
 });
-const ENDPOINT_SECRET = process.env.STRIPE_WEBHOOK_SECRET!;
+const ENDPOINT_SECRET = process.env.STRIPE_WEBHOOK_SECRET!.trim();
 
 export default async function webhookRoutes(fastify: FastifyInstance) {
     // Encapsulate the content type parser here to avoid global conflict
