@@ -3,15 +3,17 @@ import admin from "../firebase.js";
 import Stripe from "stripe";
 import type { Event } from "../types/event.js";
 
+// Ensure Stripe is initialized after dotenv (if using dotenv/config in server.ts, this is usually fine)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: "2025-01-27.acacia" });
 const db = admin.firestore();
 
 // ⚙️ CONFIGURATION
-const LOCK_TTL_MS = 2000;
-const SLIDING_TTL_SEC = 600;
+// FIX: Increased Lock TTL to 10s to account for Stripe API network latency
+const LOCK_TTL_MS = 10000;
+// FIX: Increased Cache TTL to 1 hour (Must be > Stripe Session Limit of 30 mins)
+const SLIDING_TTL_SEC = 3600;
 
 export const EventManager = {
-    // ... (keep your existing getEvent) ...
     async getEvent(eventId: string): Promise<Event | null> {
         const key = `event:${eventId}`;
         const cached = await redis.get(key);
@@ -19,24 +21,29 @@ export const EventManager = {
             await redis.expire(key, SLIDING_TTL_SEC);
             return JSON.parse(cached);
         }
+
         const doc = await db.collection("events").doc(eventId).get();
         if (!doc.exists) return null;
+
+        // Ensure data is typed correctly
         const eventData = { id: doc.id, ...doc.data() } as Event;
+
+        // Cache it
         await redis.set(key, JSON.stringify(eventData), "EX", SLIDING_TTL_SEC);
         return eventData;
     },
 
     /**
      * 🟢 STEP 1: RESERVE SEAT
-     * Decrement seats, Generate Stripe Link, Don't add to attendees yet.
+     * Decrement seats in DB & Redis, Generate Stripe Link.
      */
     async reserveSeat(eventId: string, userId: string, userEmail: string): Promise<{ url?: string; error?: string }> {
         const lockKey = `lock:event:${eventId}`;
         const dataKey = `event:${eventId}`;
 
-        // 1. Lock
+        // 1. Acquire Lock
         const lock = await redis.set(lockKey, "LOCKED", "PX", LOCK_TTL_MS, "NX");
-        if (!lock) return { error: "System busy" };
+        if (!lock) return { error: "System busy, please try again." };
 
         try {
             // 2. Get State
@@ -47,10 +54,8 @@ export const EventManager = {
             if (event.availableSeats <= 0) return { error: "Sold Out" };
             if (event.attendees?.includes(userId)) return { error: "Already joined" };
 
-            // 4. Reserve (Decrement Logic)
-            event.availableSeats--;
-
-            // 5. Create Stripe Session
+            // 4. Create Stripe Session FIRST
+            // We do this before DB writes to avoid rolling back DB if Stripe fails.
             const session = await stripe.checkout.sessions.create({
                 payment_method_types: ["card"],
                 mode: "payment",
@@ -62,20 +67,28 @@ export const EventManager = {
                     },
                     quantity: 1,
                 }],
-                metadata: { eventId, userId }, // 👈 CRITICAL: We need this in the webhook
+                metadata: { eventId, userId },
                 success_url: `${process.env.CLIENT_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
                 cancel_url: `${process.env.CLIENT_URL}/cancel`,
                 expires_at: Math.floor(Date.now() / 1000) + (30 * 60), // 30 Min Limit
             });
 
-            // 6. Save State (Reserved but not confirmed)
-            await redis.set(dataKey, JSON.stringify(event), "EX", SLIDING_TTL_SEC);
+            // 5. Update Database (Persistence)
+            // FIX: We MUST decrement in DB now. If we wait for payment, we risk overselling.
+            // If payment fails/expires, the webhook calls 'releaseSeat' which increments it back.
+            await db.collection("events").doc(eventId).update({
+                availableSeats: admin.firestore.FieldValue.increment(-1)
+            });
 
-            // Note: We do NOT sync to DB yet. We only sync confirmed changes or wait for the cache to flush.
-            // If you want to be extra safe, you can sync the "reserved" count, but typically we wait for money.
+            // 6. Update Local Object & Redis
+            event.availableSeats--;
+            await redis.set(dataKey, JSON.stringify(event), "EX", SLIDING_TTL_SEC);
 
             return { url: session.url! };
 
+        } catch (err) {
+            console.error("Reserve Error:", err);
+            return { error: "Failed to reserve seat" };
         } finally {
             await redis.del(lockKey);
         }
@@ -89,24 +102,33 @@ export const EventManager = {
         const lockKey = `lock:event:${eventId}`;
         const dataKey = `event:${eventId}`;
 
-        // Spinlock could be better here, but simple lock for now
+        // Simple Spinlock-ish wait (optional improvement: retry logic)
         await redis.set(lockKey, "LOCKED", "PX", LOCK_TTL_MS);
 
         try {
             let event = await this.getEvent(eventId);
-            if (!event) return; // Should not happen
+            if (!event) return;
 
             if (!event.attendees) event.attendees = [];
 
-            // Idempotency check: Don't add twice
+            // Idempotency check
             if (!event.attendees.includes(userId)) {
-                event.attendees.push(userId);
 
-                // Save & Sync
+                // FIX: Update Database First
+                await db.collection("events").doc(eventId).update({
+                    attendees: admin.firestore.FieldValue.arrayUnion(userId)
+                });
+
+                // Update Redis
+                event.attendees.push(userId);
                 await redis.set(dataKey, JSON.stringify(event), "EX", SLIDING_TTL_SEC);
-                await redis.xadd("stream:events", "*", "eventId", eventId, "action", "CONFIRM_PAYMENT");
+
+                // Log to stream (for other consumers)
+                await redis.xadd("stream:events", "*", "eventId", eventId, "action", "CONFIRM_PAYMENT", "userId", userId);
                 console.log(`✅ User ${userId} confirmed for ${eventId}`);
             }
+        } catch (err) {
+            console.error("Confirm Error:", err);
         } finally {
             await redis.del(lockKey);
         }
@@ -126,13 +148,20 @@ export const EventManager = {
             let event = await this.getEvent(eventId);
             if (!event) return;
 
-            // Increment back!
-            event.availableSeats++;
+            // FIX: Update Database First
+            await db.collection("events").doc(eventId).update({
+                availableSeats: admin.firestore.FieldValue.increment(1)
+            });
 
-            // Save & Sync
+            // Update Redis
+            event.availableSeats++;
             await redis.set(dataKey, JSON.stringify(event), "EX", SLIDING_TTL_SEC);
+
             await redis.xadd("stream:events", "*", "eventId", eventId, "action", "RELEASE_SEAT");
             console.log(`♻️ Seat released for ${eventId}`);
+
+        } catch (err) {
+            console.error("Release Error:", err);
         } finally {
             await redis.del(lockKey);
         }
