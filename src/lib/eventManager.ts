@@ -38,7 +38,7 @@ export const EventManager = {
      * 🟢 STEP 1: RESERVE SEAT
      * Optimistic locking + Firestore Transaction + Rollback capability
      */
-    async reserveSeat(eventId: string, userId: string, userEmail: string): Promise<{ url?: string; error?: string }> {
+    async reserveSeat(eventId: string, userId: string, userEmail: string): Promise<{ url?: string; status?: string; error?: string }> {
         const lockKey = `lock:event:${eventId}`;
         const lockToken = randomUUID(); // Unique token for this specific operation
 
@@ -55,24 +55,28 @@ export const EventManager = {
             if (event.availableSeats <= 0) throw new Error("Sold Out");
             if (event.attendees?.includes(userId)) throw new Error("Already joined");
 
-            // 3. Create Stripe Session FIRST (Slow Network Call)
-            // We do this outside the DB transaction to keep the DB lock time minimal.
-            session = await stripe.checkout.sessions.create({
-                payment_method_types: ["card"],
-                mode: "payment",
-                line_items: [{
-                    price_data: {
-                        currency: "usd",
-                        product_data: { name: event.name },
-                        unit_amount: event.price * 100,
-                    },
-                    quantity: 1,
-                }],
-                metadata: { eventId, userId },
-                success_url: `${process.env.CLIENT_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-                cancel_url: `${process.env.CLIENT_URL}/cancel`,
-                expires_at: Math.floor(Date.now() / 1000) + (60 * 60), // 30 Min Limit
-            });
+            const isFree = event.price === 0;
+
+            // 3. Create Stripe Session ONLY if paid (Slow Network Call)
+            if (!isFree) {
+                // We do this outside the DB transaction to keep the DB lock time minimal.
+                session = await stripe.checkout.sessions.create({
+                    payment_method_types: ["card"],
+                    mode: "payment",
+                    line_items: [{
+                        price_data: {
+                            currency: "usd",
+                            product_data: { name: event.name },
+                            unit_amount: event.price * 100,
+                        },
+                        quantity: 1,
+                    }],
+                    metadata: { eventId, userId },
+                    success_url: `${process.env.CLIENT_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+                    cancel_url: `${process.env.CLIENT_URL}/cancel`,
+                    expires_at: Math.floor(Date.now() / 1000) + (60 * 60), // 30 Min Limit
+                });
+            }
 
             // 4. Firestore Transaction (The "Moment of Truth")
             // This guarantees we never go below 0 seats, regardless of race conditions.
@@ -87,28 +91,39 @@ export const EventManager = {
                     throw new Error("Sold Out"); // Abort transaction
                 }
 
-                // You might also want to check double-booking here inside the transaction
+                // Check double-booking inside the transaction
                 if (data.attendees?.includes(userId)) {
                     throw new Error("Already joined");
                 }
 
-                // Decrement Seat
-                t.update(eventRef, {
+                // Prepare updates
+                const updates: any = {
                     availableSeats: admin.firestore.FieldValue.increment(-1)
-                });
+                };
+
+                // IF FREE: Add attendee immediately (No Webhook needed)
+                if (isFree) {
+                    updates.attendees = admin.firestore.FieldValue.arrayUnion(userId);
+                }
+
+                t.update(eventRef, updates);
             });
 
             // 5. Invalidate Cache (Safe pattern)
-            // Do not write back the local object. Let the next read fetch fresh data.
             await redis.del(`event:${eventId}`);
 
-            return { url: session.url! };
+            // Return appropriate response
+            if (isFree) {
+                console.log(`✅ Free seat confirmed immediately for ${userId} in ${eventId}`);
+                return { status: "confirmed" };
+            } else {
+                return { url: session!.url! };
+            }
 
         } catch (err: any) {
             console.error("Reserve Error:", err.message);
 
             // 🔴 ROLLBACK: If DB write failed, we MUST cancel the Stripe session
-            // to prevent the user from paying for a seat they didn't get.
             if (session?.id) {
                 try {
                     await stripe.checkout.sessions.expire(session.id);
@@ -121,8 +136,6 @@ export const EventManager = {
             return { error: err.message || "Failed to reserve seat" };
         } finally {
             // 6. Safe Unlock
-            // Only delete the lock if IT BELONGS TO US (token matches).
-            // This Lua script is atomic.
             const script = `
                 if redis.call("get", KEYS[1]) == ARGV[1] then
                     return redis.call("del", KEYS[1])
