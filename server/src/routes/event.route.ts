@@ -5,6 +5,29 @@ import type { Event } from "../types/event.js";
 import { EventManager } from "../lib/eventManager.js";
 
 export default async function eventRoutes(fastify: FastifyInstance) {
+    // --- CANCEL Order (Protected) ---
+    fastify.post<{ Params: { id: string } }>("/api/orders/:id/cancel", {
+        preHandler: firebaseAuth
+    }, async (request, reply) => {
+        try {
+            const orderId = request.params.id;
+            const userId = request.user?.uid;
+
+            if (!userId) return reply.code(401).send({ error: "Unauthorized" });
+
+            const result = await EventManager.cancelReservation(orderId, userId);
+            return result;
+
+        } catch (err: any) {
+            request.log.error(err);
+
+            // CRITICAL FIX: Ensure we always send a text message, never empty JSON
+            const errorMessage = err.message || "Unknown server error";
+
+            return reply.code(400).send({ error: errorMessage });
+        }
+    });
+
     const db = admin.firestore();
 
     // --- NEW: List All Events (Public) ---
@@ -137,40 +160,5 @@ export default async function eventRoutes(fastify: FastifyInstance) {
         }
     });
 
-    // --- CANCEL Order (Protected) ---
-    fastify.post<{ Params: { id: string } }>("/api/orders/:id/cancel", {
-        preHandler: firebaseAuth
-    }, async (request, reply) => {
-        try {
-            const orderId = request.params.id;
-            const userId = request.user?.uid;
 
-            console.log(`🔥 [Cancel Route] Attempting to cancel Order: ${orderId} for User: ${userId}`);
-
-            if (!userId) {
-                console.log("🔥 [Cancel Route] No User ID found");
-                return reply.code(401).send({ error: "Unauthorized" });
-            }
-
-            // Call the manager
-            const result = await EventManager.cancelReservation(orderId, userId);
-
-            console.log(`✅ [Cancel Route] Success. Result:`, result);
-            return result;
-
-        } catch (err: any) {
-            console.error("🚨 [Cancel Route] CRITICAL ERROR CAUGHT:", err);
-
-            // DEFENSIVE CODING: Ensure we never send an empty object
-            // If err.message is missing, we force a string.
-            const safeErrorMessage = (err && err.message) ? err.message : "Unknown server error";
-
-            console.log("🚨 [Cancel Route] Sending response:", { error: safeErrorMessage });
-
-            return reply.code(400).send({
-                error: safeErrorMessage,
-                details: "Check server logs for full stack trace"
-            });
-        }
-    });
 }
