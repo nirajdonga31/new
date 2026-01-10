@@ -28,17 +28,16 @@ export default async function eventRoutes(fastify: FastifyInstance) {
             const body = request.body;
             const user = request.user;
 
+            // Fixed: "constHV" -> "const"
             const newEvent = {
                 ...body,
                 createdBy: user?.uid,
                 createdAt: new Date(),
-                attendees: [],
+                // attendees: [], // Removed: Using sub-collection instead
                 availableSeats: body.seats
             };
 
-            // Save to "events" collection
             const docRef = await db.collection("events").add(newEvent);
-
             return reply.code(201).send({ success: true, id: docRef.id });
         } catch (err) {
             request.log.error(err);
@@ -64,11 +63,12 @@ export default async function eventRoutes(fastify: FastifyInstance) {
         }
     });
 
-    fastify.post<{ Params: { id: string }, Body: { quantity?: number } }>("/api/events/:id/join", {
+    fastify.post<{ Params: { id: string }, Body: { quantity: number } }>("/api/events/:id/join", {
         preHandler: firebaseAuth,
         schema: {
             body: {
                 type: "object",
+                required: ["quantity"],
                 properties: {
                     quantity: { type: "integer", minimum: 1, maximum: 4 }
                 }
@@ -80,8 +80,7 @@ export default async function eventRoutes(fastify: FastifyInstance) {
             const userId = request.user?.uid;
             const userEmail = request.user?.email || "unknown";
 
-            // 🔴 FIX: Safety check for body using "?."
-            const quantity = request.body?.quantity || 1;
+            const { quantity } = request.body;
 
             if (!userId) {
                 return reply.code(401).send({ error: "Unauthorized" });
@@ -90,13 +89,13 @@ export default async function eventRoutes(fastify: FastifyInstance) {
             const result = await EventManager.reserveSeat(eventId, userId, userEmail, quantity);
 
             if (result.error) {
-                // Return 409 for logical errors (Sold Out), 500 is only for crashes
                 return reply.code(409).send({ error: result.error });
             }
 
             return {
                 success: true,
                 paymentUrl: result.url,
+                orderId: result.orderId,
                 message: `Reserved ${quantity} seats. Please complete payment.`
             };
 
@@ -106,4 +105,21 @@ export default async function eventRoutes(fastify: FastifyInstance) {
         }
     });
 
+    // --- POST: Cancel Order ---
+    fastify.post<{ Params: { id: string } }>("/api/orders/:id/cancel", {
+        preHandler: firebaseAuth
+    }, async (request, reply) => {
+        try {
+            const orderId = request.params.id;
+            const userId = request.user?.uid;
+
+            if (!userId) return reply.code(401).send({ error: "Unauthorized" });
+
+            const result = await EventManager.cancelReservation(orderId, userId);
+            return result;
+        } catch (err: any) {
+            request.log.error(err);
+            return reply.code(400).send({ error: err.message || "Failed to cancel" });
+        }
+    });
 }

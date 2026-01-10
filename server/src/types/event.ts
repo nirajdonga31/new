@@ -8,6 +8,5 @@ export interface Event {
     availableSeats: number;
     createdBy: string;
     createdAt: Date;
-    attendees?: string[];
+    // attendees field removed to support scaling via sub-collections
 }
-//sa
