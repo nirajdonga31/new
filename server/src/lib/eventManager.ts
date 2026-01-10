@@ -4,6 +4,8 @@ import Stripe from "stripe";
 import { randomUUID } from "crypto";
 import type { Event } from "../types/event.js";
 
+const JOB_QUEUE_KEY = "scheduler:session_expiration";
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
     apiVersion: "2025-01-27.acacia" as any
 });
@@ -93,12 +95,21 @@ export const EventManager = {
                         orderId: orderRef.id // Link Stripe to our Order
                     },
                     success_url: `${process.env.CLIENT_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-                    cancel_url: `${process.env.CLIENT_URL}/cancel`,
-                    expires_at: Math.floor(Date.now() / 1000) + (10 * 60), // 10 mins
+                    cancel_url: `${process.env.CLIENT_URL}/cancle?orderId=${orderRef.id}`,
+                    expires_at: Math.floor(Date.now() / 1000) + (30 * 60), // 10 mins
                 });
 
                 // Update order with session ID
                 await orderRef.update({ sessionId: session.id });
+
+                const expireAt = Date.now() + (10 * 60 * 1000);
+
+                await redis.zadd(
+                    JOB_QUEUE_KEY,
+                    expireAt,
+                    session.id // The value is the session ID
+                );
+
             }
 
             // 6. DB Transaction: Reserve Seats
