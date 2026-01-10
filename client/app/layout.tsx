@@ -1,16 +1,21 @@
 import { AuthProvider } from "@/context/AuthContext";
+import { Navbar } from "@/components/NavBar";
 import "./globals.css";
+
+export const metadata = {
+  title: "Event Booking App",
+  description: "Book your seats now",
+};
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
       <body className="bg-gray-50 min-h-screen font-sans text-gray-900">
         <AuthProvider>
-          <header className="p-4 bg-white shadow-sm mb-6 flex gap-6 text-sm font-medium">
-            <a href="/" className="hover:underline">Events</a>
-            <a href="/orders" className="hover:underline">My Orders</a>
-          </header>
-          <main className="container mx-auto px-4 max-w-4xl">{children}</main>
+          <Navbar />
+          <main className="container mx-auto px-4 py-8 max-w-4xl">
+            {children}
+          </main>
         </AuthProvider>
       </body>
     </html>

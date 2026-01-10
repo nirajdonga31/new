@@ -7,7 +7,63 @@ import { EventManager } from "../lib/eventManager.js";
 export default async function eventRoutes(fastify: FastifyInstance) {
     const db = admin.firestore();
 
-    // --- POST: Create a new Event ---
+    // --- NEW: List All Events (Public) ---
+    // Fixes the error on your Frontend Home Page
+    fastify.get("/api/events", async (request, reply) => {
+        try {
+            const snapshot = await db.collection("events").get();
+            // Map the documents to a clean array
+            const events = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            return { events };
+        } catch (err) {
+            request.log.error(err);
+            return reply.code(500).send({ error: "Failed to fetch events" });
+        }
+    });
+
+    fastify.get("/api/orders", {
+        preHandler: firebaseAuth
+    }, async (request, reply) => {
+        try {
+            const userId = request.user?.uid;
+            if (!userId) return reply.code(401).send({ error: "Unauthorized" });
+
+            const snapshot = await db.collection("orders")
+                .where("userId", "==", userId)
+                // .orderBy("createdAt", "desc")  <-- COMMENT THIS OUT FOR NOW
+                .get();
+
+            const orders = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            return { orders };
+        } catch (err) {
+            request.log.error(err);
+            return reply.code(500).send({ error: "Failed to fetch orders" });
+        }
+    });
+
+    // --- GET Event by ID ---
+    fastify.get<{ Params: { id: string } }>("/api/events/:id", async (request, reply) => {
+        try {
+            const { id } = request.params;
+            const doc = await db.collection("events").doc(id).get();
+
+            if (!doc.exists) {
+                return reply.code(404).send({ error: "Event not found" });
+            }
+            return { id: doc.id, ...doc.data() };
+        } catch (err) {
+            request.log.error(err);
+            return reply.code(500).send({ error: "Database error" });
+        }
+    });
+
+    // --- CREATE Event (Protected) ---
     fastify.post<{ Body: Event }>("/api/events", {
         preHandler: firebaseAuth,
         schema: {
@@ -28,12 +84,10 @@ export default async function eventRoutes(fastify: FastifyInstance) {
             const body = request.body;
             const user = request.user;
 
-            // Fixed: "constHV" -> "const"
             const newEvent = {
                 ...body,
                 createdBy: user?.uid,
                 createdAt: new Date(),
-                // attendees: [], // Removed: Using sub-collection instead
                 availableSeats: body.seats
             };
 
@@ -45,24 +99,7 @@ export default async function eventRoutes(fastify: FastifyInstance) {
         }
     });
 
-    // --- GET: Fetch Event by ID ---
-    fastify.get<{ Params: { id: string } }>("/api/events/:id", async (request, reply) => {
-        try {
-            const { id } = request.params;
-            const doc = await db.collection("events").doc(id).get();
-
-            if (!doc.exists) {
-                return reply.code(404).send({ error: "Event not found" });
-            }
-
-            // Return data with the ID included
-            return { id: doc.id, ...doc.data() };
-        } catch (err) {
-            request.log.error(err);
-            return reply.code(500).send({ error: "Database error" });
-        }
-    });
-
+    // --- JOIN Event (Protected) ---
     fastify.post<{ Params: { id: string }, Body: { quantity: number } }>("/api/events/:id/join", {
         preHandler: firebaseAuth,
         schema: {
@@ -79,24 +116,19 @@ export default async function eventRoutes(fastify: FastifyInstance) {
             const eventId = request.params.id;
             const userId = request.user?.uid;
             const userEmail = request.user?.email || "unknown";
-
             const { quantity } = request.body;
 
-            if (!userId) {
-                return reply.code(401).send({ error: "Unauthorized" });
-            }
+            if (!userId) return reply.code(401).send({ error: "Unauthorized" });
 
             const result = await EventManager.reserveSeat(eventId, userId, userEmail, quantity);
 
-            if (result.error) {
-                return reply.code(409).send({ error: result.error });
-            }
+            if (result.error) return reply.code(409).send({ error: result.error });
 
             return {
                 success: true,
                 paymentUrl: result.url,
                 orderId: result.orderId,
-                message: `Reserved ${quantity} seats. Please complete payment.`
+                message: `Reserved ${quantity} seats.`
             };
 
         } catch (err) {
@@ -105,7 +137,7 @@ export default async function eventRoutes(fastify: FastifyInstance) {
         }
     });
 
-    // --- POST: Cancel Order ---
+    // --- CANCEL Order (Protected) ---
     fastify.post<{ Params: { id: string } }>("/api/orders/:id/cancel", {
         preHandler: firebaseAuth
     }, async (request, reply) => {

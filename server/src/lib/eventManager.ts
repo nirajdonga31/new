@@ -46,6 +46,10 @@ export const EventManager = {
             const event = await this.getEvent(eventId);
             if (!event) throw new Error("Event not found");
 
+            if (event.createdBy === userId) {
+                throw new Error("You cannot buy tickets for your own event.");
+            }
+
             // 2. Check Availability (Optimistic)
             if (event.availableSeats < quantity) {
                 throw new Error(`Only ${event.availableSeats} seats available`);
