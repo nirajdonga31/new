@@ -15,33 +15,39 @@ export default function EventDetails() {
     const [qty, setQty] = useState(1);
     const [loading, setLoading] = useState(false);
 
-    // Track if we are intentionally leaving to pay (so we don't auto-cancel)
+    // NEW: Track if user is already a confirmed attendee
+    const [hasJoined, setHasJoined] = useState(false);
+
     const isBooking = useRef(false);
 
     const fetchEvent = () => {
         if (id) apiRequest(`/events/${id}`).then(setEvent).catch(console.error);
     };
 
-    // --- AUTOMATIC CLEANUP LOGIC ---
-    const cleanupStaleOrders = async () => {
+    // --- CHECK USER STATUS ---
+    const checkUserStatus = async () => {
         if (!user || !id) return;
         try {
-            // 1. Check if user has a pending order for this event
             const res = await apiRequest("/orders");
+
+            // 1. Check for Pending (Stale) Orders to auto-cancel
             const pending = res.orders.find((o: any) =>
                 o.eventId === id && o.status === 'pending'
             );
-
-            // 2. If found, SILENTLY cancel it immediately
-            if (pending) {
-                console.log("Found stale pending order. Auto-cancelling...");
+            if (pending && !isBooking.current) {
+                console.log("Auto-cancelling stale order...");
                 await apiRequest(`/orders/${pending.id}/cancel`, { method: "POST" });
-
-                // 3. Refresh event to show the seats are now free
                 fetchEvent();
             }
+
+            // 2. NEW: Check for Confirmed/Paid Orders
+            const joined = res.orders.find((o: any) =>
+                o.eventId === id && (o.status === 'paid' || o.status === 'confirmed')
+            );
+            setHasJoined(!!joined);
+
         } catch (err) {
-            console.error("Auto-cleanup failed:", err);
+            console.error("Status check failed:", err);
         }
     };
 
@@ -50,31 +56,37 @@ export default function EventDetails() {
     }, [id]);
 
     useEffect(() => {
-        // Run cleanup whenever the user lands on this page
-        cleanupStaleOrders();
+        checkUserStatus();
     }, [id, user]);
 
     const book = async () => {
         if (!user) return router.push("/login");
 
         setLoading(true);
-        isBooking.current = true; // Mark that we are intentionally leaving
+        isBooking.current = true;
 
         try {
+            // For free events, force quantity to 1
+            const quantityToBuy = (event.price === 0) ? 1 : qty;
+
             const res = await apiRequest(`/events/${id}/join`, {
                 method: "POST",
-                body: JSON.stringify({ quantity: qty }),
+                body: JSON.stringify({ quantity: quantityToBuy }),
             });
+
             if (res.paymentUrl) window.location.href = res.paymentUrl;
             else router.push("/orders");
+
         } catch (err: any) {
             alert(err.message);
             setLoading(false);
-            isBooking.current = false; // Reset if failed
+            isBooking.current = false;
         }
     };
 
     if (!event) return <div className="p-10 text-center">Loading event...</div>;
+
+    const isFree = event.price === 0;
 
     return (
         <div className="max-w-2xl mx-auto space-y-6">
@@ -86,22 +98,36 @@ export default function EventDetails() {
                     <span>💲 ${event.price}</span>
                 </div>
 
-                {/* Standard Booking Form (No banners, just works) */}
-                <div className="flex items-end gap-4">
-                    <div className="w-24">
-                        <label className="text-xs font-semibold uppercase text-gray-500">Seats</label>
-                        <Input
-                            type="number"
-                            min={1}
-                            max={4}
-                            value={qty}
-                            onChange={(e) => setQty(Number(e.target.value))}
-                        />
+                {/* LOGIC: If Free & Joined -> Hide Form. Else -> Show Form */}
+                {hasJoined ? (
+                    <div className="p-6 bg-green-50 border border-green-200 rounded-lg text-center">
+                        <h3 className="text-lg font-semibold text-green-800">You're going!</h3>
+                        <p className="text-green-600 mb-4">You have already joined this event.</p>
+                        <Button variant="outline" onClick={() => router.push("/orders")}>
+                            View Ticket
+                        </Button>
                     </div>
-                    <Button onClick={book} disabled={loading || event.availableSeats < 1} className="flex-1" size="lg">
-                        {loading ? "Processing..." : `Confirm Booking ($${event.price * qty})`}
-                    </Button>
-                </div>
+                ) : (
+                    <div className="flex items-end gap-4">
+                        {/* Hide Quantity Input for Free Events */}
+                        {!isFree && (
+                            <div className="w-24">
+                                <label className="text-xs font-semibold uppercase text-gray-500">Seats</label>
+                                <Input
+                                    type="number"
+                                    min={1}
+                                    max={4}
+                                    value={qty}
+                                    onChange={(e) => setQty(Number(e.target.value))}
+                                />
+                            </div>
+                        )}
+
+                        <Button onClick={book} disabled={loading || event.availableSeats < 1} className="flex-1" size="lg">
+                            {loading ? "Processing..." : (isFree ? "Join for Free" : `Confirm Booking ($${event.price * qty})`)}
+                        </Button>
+                    </div>
+                )}
             </div>
         </div>
     );

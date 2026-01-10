@@ -28,15 +28,10 @@ export const EventManager = {
     },
 
     async reserveSeat(eventId: string, userId: string, userEmail: string, quantity: number): Promise<{ url?: string; sessionId?: string; orderId?: string; status?: string; error?: string }> {
-        // ... (Keep your reserveSeat logic exactly as it was) ...
-        // (I am omitting the top part to save space, assuming it is unchanged from your last working version)
-
-        // COPY-PASTE YOUR EXISTING reserveSeat CODE HERE
-        // OR Use the one from the file below if you want the full file
-
-        // --- Quick Mock of reserveSeat for context (Do not copy this comment block, use your full code) ---
         const lockKey = `lock:event:${eventId}`;
         const lockToken = randomUUID();
+
+        // 1. Acquire Lock
         const acquired = await redis.set(lockKey, lockToken, "PX", LOCK_TTL_MS, "NX");
         if (!acquired) return { error: "System busy, please try again." };
 
@@ -46,14 +41,28 @@ export const EventManager = {
         try {
             const event = await this.getEvent(eventId);
             if (!event) throw new Error("Event not found");
-            if (event.createdBy === userId) throw new Error("You cannot buy tickets for your own event.");
-            if (event.availableSeats < quantity) throw new Error(`Only ${event.availableSeats} seats available`);
 
-            const attendeeDoc = await db.collection("events").doc(eventId).collection("attendees").doc(userId).get();
-            if (attendeeDoc.exists) throw new Error("Already joined");
+            if (event.createdBy === userId) {
+                throw new Error("You cannot buy tickets for your own event.");
+            }
 
+            // 2. Check Availability
+            if (event.availableSeats < quantity) {
+                throw new Error(`Only ${event.availableSeats} seats available`);
+            }
+
+            // --- NEW: STRICT LIMIT FOR FREE EVENTS ---
             const isFree = event.price === 0;
+            if (isFree && quantity > 1) {
+                throw new Error("Free events are limited to 1 ticket per user.");
+            }
+            // -----------------------------------------
 
+            // 3. Check Duplicate
+            const attendeeDoc = await db.collection("events").doc(eventId).collection("attendees").doc(userId).get();
+            if (attendeeDoc.exists && isFree) throw new Error("Already joined");
+
+            // 4. Create Pending Order Record
             orderRef = db.collection("orders").doc();
             await orderRef.set({
                 id: orderRef.id,
@@ -65,6 +74,7 @@ export const EventManager = {
                 createdAt: new Date()
             });
 
+            // 5. Create Stripe Session (if paid)
             if (!isFree) {
                 session = await stripe.checkout.sessions.create({
                     payment_method_types: ["card"],
@@ -73,6 +83,7 @@ export const EventManager = {
                         price_data: {
                             currency: "usd",
                             product_data: { name: event.name },
+                            // Corrected logic: Unit amount is price per item. Stripe handles the multiplication.
                             unit_amount: event.price * 100,
                         },
                         quantity: quantity,
@@ -95,6 +106,7 @@ export const EventManager = {
                 await redis.zadd(JOB_QUEUE_KEY, expireAt, session.id);
             }
 
+            // 6. DB Transaction: Reserve Seats
             const eventRef = db.collection("events").doc(eventId);
             await db.runTransaction(async (t) => {
                 const doc = await t.get(eventRef);
@@ -114,6 +126,7 @@ export const EventManager = {
             });
 
             await redis.del(`event:${eventId}`);
+
             if (isFree) return { status: "confirmed", orderId: orderRef.id };
             else return { url: session!.url!, sessionId: session!.id, orderId: orderRef.id };
 
@@ -154,48 +167,34 @@ export const EventManager = {
         }
     },
 
-    // --- FIX 1: UPDATE releaseSeat TO BE IDEMPOTENT ---
     async releaseSeat(eventId: string, stripeEventId: string, quantity: number, orderId?: string) {
         const lockKey = `lock:event:${eventId}`;
         const lockToken = randomUUID();
         await redis.set(lockKey, lockToken, "PX", LOCK_TTL_MS);
-
         try {
             const webhookRef = db.collection("webhook_events").doc(stripeEventId);
             await db.runTransaction(async (t) => {
-                // 1. Check if webhook already processed
                 const webhookDoc = await t.get(webhookRef);
                 if (webhookDoc.exists) return;
 
-                // 2. IMPORTANT: Check if Order is ALREADY expired (by the manual cancel)
                 let alreadyHandled = false;
                 if (orderId) {
                     const orderRef = db.collection("orders").doc(orderId);
                     const orderDoc = await t.get(orderRef);
                     if (orderDoc.exists) {
                         const status = orderDoc.data()?.status;
-                        if (status === 'expired' || status === 'cancelled') {
-                            alreadyHandled = true;
-                        } else {
-                            // Mark as expired if not already
-                            t.update(orderRef, { status: 'expired' });
-                        }
+                        if (status === 'expired' || status === 'cancelled') alreadyHandled = true;
+                        else t.update(orderRef, { status: 'expired' });
                     }
                 }
 
-                // 3. Mark webhook as processed
                 t.set(webhookRef, { processedAt: new Date(), type: 'releaseSeat', quantity });
 
-                // 4. ONLY increment seats if the order wasn't already expired
                 if (!alreadyHandled) {
                     const eventRef = db.collection("events").doc(eventId);
                     t.update(eventRef, { availableSeats: admin.firestore.FieldValue.increment(quantity) });
-                    console.log(`[Webhook] Released ${quantity} seats for ${eventId}`);
-                } else {
-                    console.log(`[Webhook] Skipped releasing seats (already done by manual cancel)`);
                 }
             });
-
             await redis.del(`event:${eventId}`);
         } catch (err) { console.error("Release Error:", err); }
         finally {
@@ -204,10 +203,7 @@ export const EventManager = {
         }
     },
 
-    // --- FIX 2: UPDATE cancelReservation TO BE IDEMPOTENT ---
     async cancelReservation(orderId: string, userId: string) {
-        console.log(`[Manager] Cancelling Order: ${orderId}`);
-
         const orderRef = db.collection("orders").doc(orderId);
         const order = await orderRef.get();
 
@@ -219,45 +215,35 @@ export const EventManager = {
             return { success: true, message: "Already cancelled" };
         }
         if (data.status !== 'pending' && data.status !== 'failed') {
-            throw new Error("Cannot cancel completed order");
+            throw new Error("Cannot cancel completed or expired order");
         }
 
         if (data.sessionId) {
             try {
                 await stripe.checkout.sessions.expire(data.sessionId);
             } catch (err: any) {
-                // Check for "Already Expired" error
                 const isStale = err.code === 'resource_missing' ||
                     err.message.includes('expire') ||
                     err.message.includes('status');
 
                 if (isStale) {
-                    console.log("⚠️ Session stale. Force-releasing seats...");
-
                     await db.runTransaction(async (t) => {
-                        // 1. RE-READ Order inside transaction to prevent race condition
                         const freshOrder = await t.get(orderRef);
                         const freshData = freshOrder.data();
+                        if (freshData?.status === 'expired' || freshData?.status === 'cancelled') return;
 
-                        // If webhook updated it to 'expired' just now, DO NOTHING
-                        if (freshData?.status === 'expired' || freshData?.status === 'cancelled') {
-                            return;
-                        }
-
-                        // Otherwise, we do the work
                         const eventRef = db.collection("events").doc(data.eventId);
                         t.update(eventRef, {
                             availableSeats: admin.firestore.FieldValue.increment(data.quantity)
                         });
                         t.update(orderRef, { status: 'expired' });
                     });
-
                     return { success: true, message: "Fixed stale order" };
                 }
                 throw err;
             }
             return { success: true, message: "Reservation cancelled" };
         }
-        return { success: false, error: "No active session" };
+        return { success: false, error: "No active session to cancel" };
     }
 };

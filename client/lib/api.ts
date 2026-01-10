@@ -22,10 +22,10 @@ export async function apiRequest(endpoint: string, options: RequestInit = {}) {
     // 3. Handle response
     const data = await res.json();
 
-    if (!res.ok) {
-        console.error("🚨 BACKEND ERROR DETAILS:", data);
-        throw new Error(data.error || "Request failed");
-    }
+    // if (!res.ok) {
+    //     console.error("🚨 BACKEND ERROR DETAILS:", data);
+    //     throw new Error(data.error || "Request failed");
+    // }
 
     return data;
 }
