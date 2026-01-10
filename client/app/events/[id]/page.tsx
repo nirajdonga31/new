@@ -15,32 +15,31 @@ export default function EventDetails() {
     const [qty, setQty] = useState(1);
     const [loading, setLoading] = useState(false);
 
-    // NEW: Track if user is already a confirmed attendee
     const [hasJoined, setHasJoined] = useState(false);
-
     const isBooking = useRef(false);
 
     const fetchEvent = () => {
         if (id) apiRequest(`/events/${id}`).then(setEvent).catch(console.error);
     };
 
-    // --- CHECK USER STATUS ---
     const checkUserStatus = async () => {
         if (!user || !id) return;
         try {
             const res = await apiRequest("/orders");
 
-            // 1. Check for Pending (Stale) Orders to auto-cancel
+            // 1. Auto-cancel stale pending orders
+            // We check !isBooking.current so we don't kill the order we just tried to make
             const pending = res.orders.find((o: any) =>
                 o.eventId === id && o.status === 'pending'
             );
+
             if (pending && !isBooking.current) {
                 console.log("Auto-cancelling stale order...");
                 await apiRequest(`/orders/${pending.id}/cancel`, { method: "POST" });
                 fetchEvent();
             }
 
-            // 2. NEW: Check for Confirmed/Paid Orders
+            // 2. Check if user has joined (paid/confirmed)
             const joined = res.orders.find((o: any) =>
                 o.eventId === id && (o.status === 'paid' || o.status === 'confirmed')
             );
@@ -51,13 +50,8 @@ export default function EventDetails() {
         }
     };
 
-    useEffect(() => {
-        fetchEvent();
-    }, [id]);
-
-    useEffect(() => {
-        checkUserStatus();
-    }, [id, user]);
+    useEffect(() => { fetchEvent(); }, [id]);
+    useEffect(() => { checkUserStatus(); }, [id, user]);
 
     const book = async () => {
         if (!user) return router.push("/login");
@@ -66,21 +60,32 @@ export default function EventDetails() {
         isBooking.current = true;
 
         try {
-            // For free events, force quantity to 1
-            const quantityToBuy = (event.price === 0) ? 1 : qty;
+            const quantityToBuy = (event?.price === 0) ? 1 : qty;
 
             const res = await apiRequest(`/events/${id}/join`, {
                 method: "POST",
                 body: JSON.stringify({ quantity: quantityToBuy }),
             });
 
-            if (res.paymentUrl) window.location.href = res.paymentUrl;
-            else router.push("/orders");
+            // --- FIX: Validation Logic ---
+            const isPaidEvent = event.price > 0;
+
+            if (isPaidEvent && !res.paymentUrl) {
+                // If it's paid but no link, THROW ERROR instead of redirecting
+                throw new Error("Server failed to generate payment link.");
+            }
+
+            if (res.paymentUrl) {
+                window.location.href = res.paymentUrl;
+            } else {
+                // Only redirect to orders for Free events
+                router.push("/orders");
+            }
 
         } catch (err: any) {
-            alert(err.message);
+            alert(err.message || "Booking failed");
             setLoading(false);
-            isBooking.current = false;
+            isBooking.current = false; // Reset lock so cleanup can run if needed
         }
     };
 
@@ -98,8 +103,7 @@ export default function EventDetails() {
                     <span>💲 ${event.price}</span>
                 </div>
 
-                {/* LOGIC: If Free & Joined -> Hide Form. Else -> Show Form */}
-                {hasJoined ? (
+                {hasJoined && isFree ? (
                     <div className="p-6 bg-green-50 border border-green-200 rounded-lg text-center">
                         <h3 className="text-lg font-semibold text-green-800">You're going!</h3>
                         <p className="text-green-600 mb-4">You have already joined this event.</p>
@@ -109,7 +113,6 @@ export default function EventDetails() {
                     </div>
                 ) : (
                     <div className="flex items-end gap-4">
-                        {/* Hide Quantity Input for Free Events */}
                         {!isFree && (
                             <div className="w-24">
                                 <label className="text-xs font-semibold uppercase text-gray-500">Seats</label>
@@ -127,6 +130,12 @@ export default function EventDetails() {
                             {loading ? "Processing..." : (isFree ? "Join for Free" : `Confirm Booking ($${event.price * qty})`)}
                         </Button>
                     </div>
+                )}
+
+                {hasJoined && !isFree && (
+                    <p className="text-xs text-green-600 mt-2 text-center">
+                        ✅ You already have tickets, but you can book more.
+                    </p>
                 )}
             </div>
         </div>

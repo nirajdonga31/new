@@ -56,7 +56,7 @@ export default async function eventRoutes(fastify: FastifyInstance) {
 
             const snapshot = await db.collection("orders")
                 .where("userId", "==", userId)
-                // .orderBy("createdAt", "desc")  <-- COMMENT THIS OUT FOR NOW
+                .orderBy("createdAt", "desc")
                 .get();
 
             const orders = snapshot.docs.map(doc => ({

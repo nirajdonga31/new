@@ -42,27 +42,19 @@ export const EventManager = {
             const event = await this.getEvent(eventId);
             if (!event) throw new Error("Event not found");
 
-            if (event.createdBy === userId) {
-                throw new Error("You cannot buy tickets for your own event.");
-            }
+            if (event.createdBy === userId) throw new Error("You cannot buy tickets for your own event.");
+            if (event.availableSeats < quantity) throw new Error(`Only ${event.availableSeats} seats available`);
 
-            // 2. Check Availability
-            if (event.availableSeats < quantity) {
-                throw new Error(`Only ${event.availableSeats} seats available`);
-            }
-
-            // --- NEW: STRICT LIMIT FOR FREE EVENTS ---
             const isFree = event.price === 0;
-            if (isFree && quantity > 1) {
-                throw new Error("Free events are limited to 1 ticket per user.");
+
+            // 2. Duplicate Check (Only for Free Events)
+            if (isFree) {
+                const attendeeDoc = await db.collection("events").doc(eventId).collection("attendees").doc(userId).get();
+                if (attendeeDoc.exists) throw new Error("You have already joined this free event.");
+                if (quantity > 1) throw new Error("Free events are limited to 1 ticket.");
             }
-            // -----------------------------------------
 
-            // 3. Check Duplicate
-            const attendeeDoc = await db.collection("events").doc(eventId).collection("attendees").doc(userId).get();
-            if (attendeeDoc.exists && isFree) throw new Error("Already joined");
-
-            // 4. Create Pending Order Record
+            // 3. Create Pending Order
             orderRef = db.collection("orders").doc();
             await orderRef.set({
                 id: orderRef.id,
@@ -74,7 +66,7 @@ export const EventManager = {
                 createdAt: new Date()
             });
 
-            // 5. Create Stripe Session (if paid)
+            // 4. Create Stripe Session (Paid Only)
             if (!isFree) {
                 session = await stripe.checkout.sessions.create({
                     payment_method_types: ["card"],
@@ -83,17 +75,11 @@ export const EventManager = {
                         price_data: {
                             currency: "usd",
                             product_data: { name: event.name },
-                            // Corrected logic: Unit amount is price per item. Stripe handles the multiplication.
                             unit_amount: event.price * 100,
                         },
                         quantity: quantity,
                     }],
-                    metadata: {
-                        eventId,
-                        userId,
-                        quantity: quantity.toString(),
-                        orderId: orderRef.id
-                    },
+                    metadata: { eventId, userId, quantity: quantity.toString(), orderId: orderRef.id },
                     success_url: `${process.env.CLIENT_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
                     cancel_url: `${process.env.CLIENT_URL}/cancle?orderId=${orderRef.id}`,
                     expires_at: Math.floor(Date.now() / 1000) + (30 * 60),
@@ -101,25 +87,31 @@ export const EventManager = {
 
                 await orderRef.update({ sessionId: session.id });
 
+                // Add to Redis Worker
                 const JOB_QUEUE_KEY = "scheduler:session_expiration";
                 const expireAt = Date.now() + (10 * 60 * 1000);
                 await redis.zadd(JOB_QUEUE_KEY, expireAt, session.id);
             }
 
-            // 6. DB Transaction: Reserve Seats
+            // 5. DB Transaction
             const eventRef = db.collection("events").doc(eventId);
             await db.runTransaction(async (t) => {
                 const doc = await t.get(eventRef);
-                if (!doc.exists) throw new Error("Event not found");
-                const attRef = eventRef.collection("attendees").doc(userId);
-                const attDoc = await t.get(attRef);
-                if (attDoc.exists) throw new Error("Already joined");
                 const data = doc.data() as Event;
                 if (data.availableSeats < quantity) throw new Error("Sold Out");
 
+                // Check free duplicate again inside transaction
+                if (isFree) {
+                    const attRef = eventRef.collection("attendees").doc(userId);
+                    const attDoc = await t.get(attRef);
+                    if (attDoc.exists) throw new Error("Already joined");
+                }
+
                 t.update(eventRef, { availableSeats: admin.firestore.FieldValue.increment(-quantity) });
 
+                // Confirm free events immediately
                 if (isFree) {
+                    const attRef = eventRef.collection("attendees").doc(userId);
                     t.set(attRef, { joinedAt: new Date(), email: userEmail, orderId: orderRef!.id });
                     t.update(orderRef!, { status: 'confirmed' });
                 }
@@ -127,6 +119,7 @@ export const EventManager = {
 
             await redis.del(`event:${eventId}`);
 
+            // Return URL for paid, status for free
             if (isFree) return { status: "confirmed", orderId: orderRef.id };
             else return { url: session!.url!, sessionId: session!.id, orderId: orderRef.id };
 
@@ -150,8 +143,11 @@ export const EventManager = {
             await db.runTransaction(async (t) => {
                 const webhookDoc = await t.get(webhookRef);
                 if (webhookDoc.exists) return;
+
                 const eventRef = db.collection("events").doc(eventId);
                 const attendeeRef = eventRef.collection("attendees").doc(userId);
+
+                // Merge: true allows multiple bookings
                 t.set(attendeeRef, { joinedAt: new Date(), stripeEventId }, { merge: true });
                 t.set(webhookRef, { processedAt: new Date(), type: 'confirmSeat', quantity });
                 if (orderId) {
@@ -211,31 +207,21 @@ export const EventManager = {
         const data = order.data()!;
 
         if (data.userId !== userId) throw new Error("Unauthorized");
-        if (data.status === 'expired' || data.status === 'cancelled') {
-            return { success: true, message: "Already cancelled" };
-        }
-        if (data.status !== 'pending' && data.status !== 'failed') {
-            throw new Error("Cannot cancel completed or expired order");
-        }
+        if (data.status === 'expired' || data.status === 'cancelled') return { success: true, message: "Already cancelled" };
+        if (data.status !== 'pending' && data.status !== 'failed') throw new Error("Cannot cancel completed or expired order");
 
         if (data.sessionId) {
             try {
                 await stripe.checkout.sessions.expire(data.sessionId);
             } catch (err: any) {
-                const isStale = err.code === 'resource_missing' ||
-                    err.message.includes('expire') ||
-                    err.message.includes('status');
-
+                const isStale = err.code === 'resource_missing' || err.message.includes('expire') || err.message.includes('status');
                 if (isStale) {
                     await db.runTransaction(async (t) => {
                         const freshOrder = await t.get(orderRef);
-                        const freshData = freshOrder.data();
-                        if (freshData?.status === 'expired' || freshData?.status === 'cancelled') return;
+                        if (freshOrder.data()?.status === 'expired') return;
 
                         const eventRef = db.collection("events").doc(data.eventId);
-                        t.update(eventRef, {
-                            availableSeats: admin.firestore.FieldValue.increment(data.quantity)
-                        });
+                        t.update(eventRef, { availableSeats: admin.firestore.FieldValue.increment(data.quantity) });
                         t.update(orderRef, { status: 'expired' });
                     });
                     return { success: true, message: "Fixed stale order" };
@@ -244,6 +230,6 @@ export const EventManager = {
             }
             return { success: true, message: "Reservation cancelled" };
         }
-        return { success: false, error: "No active session to cancel" };
+        return { success: false, error: "No active session" };
     }
 };
