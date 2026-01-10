@@ -145,13 +145,32 @@ export default async function eventRoutes(fastify: FastifyInstance) {
             const orderId = request.params.id;
             const userId = request.user?.uid;
 
-            if (!userId) return reply.code(401).send({ error: "Unauthorized" });
+            console.log(`🔥 [Cancel Route] Attempting to cancel Order: ${orderId} for User: ${userId}`);
 
+            if (!userId) {
+                console.log("🔥 [Cancel Route] No User ID found");
+                return reply.code(401).send({ error: "Unauthorized" });
+            }
+
+            // Call the manager
             const result = await EventManager.cancelReservation(orderId, userId);
+
+            console.log(`✅ [Cancel Route] Success. Result:`, result);
             return result;
+
         } catch (err: any) {
-            request.log.error(err);
-            return reply.code(400).send({ error: err.message || "Failed to cancel" });
+            console.error("🚨 [Cancel Route] CRITICAL ERROR CAUGHT:", err);
+
+            // DEFENSIVE CODING: Ensure we never send an empty object
+            // If err.message is missing, we force a string.
+            const safeErrorMessage = (err && err.message) ? err.message : "Unknown server error";
+
+            console.log("🚨 [Cancel Route] Sending response:", { error: safeErrorMessage });
+
+            return reply.code(400).send({
+                error: safeErrorMessage,
+                details: "Check server logs for full stack trace"
+            });
         }
     });
 }

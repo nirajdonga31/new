@@ -13,6 +13,14 @@ export async function apiRequest(endpoint: string, options: RequestInit = {}) {
     });
 
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Request failed");
+
+    // --- DEBUGGING CHANGE ---
+    if (!res.ok) {
+        // This will print the REAL reason (e.g. "Order not found", "Stripe Error")
+        console.error("🚨 BACKEND ERROR DETAILS:", data);
+        throw new Error(data.error || "Request failed");
+    }
+    // ------------------------
+
     return data;
 }
