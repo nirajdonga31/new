@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useSearchParams, useRouter } from "next/navigation"; // New hooks
+import { useSearchParams, useRouter } from "next/navigation";
 import { apiRequest } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -14,10 +14,12 @@ export default function CancelPage() {
 
     useEffect(() => {
         if (orderId) {
-            // Immediately call the backend to release seats
+            // Automatically release the seats
             apiRequest(`/orders/${orderId}/cancel`, { method: "POST" })
                 .then(() => setStatus("Reservation cancelled. Seats released."))
                 .catch(() => setStatus("Reservation already expired or failed."));
+        } else {
+            setStatus("No order found to cancel.");
         }
     }, [orderId]);
 
